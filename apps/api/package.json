@@ -5,9 +5,10 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
-    "dev": "node --watch --experimental-strip-types ./src/index.ts",
-    "start": "node --experimental-strip-types ./src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "dev": "node --watch --experimental-transform-types ./src/index.ts",
+    "start": "node --experimental-transform-types ./src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-transform-types ./src/**/*.test.ts"
   },
   "dependencies": {
     "@oni/shared": "*",

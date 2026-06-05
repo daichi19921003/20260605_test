@@ -4,7 +4,8 @@
 GPS で参加し、ジオフェンスで鬼と逃走者が一定距離(既定 10m)まで近づくと
 **鬼が自動で切り替わる**のがコアルール。
 
-> ステータス: **Phase 0(基盤構築)完了**。詳細は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+> ステータス: **Phase 0–6 のドメイン/API ロジック実装済み**(インメモリ実装で動作・テスト15件通過)。
+> 詳細とロードマップは [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## コンセプト
 

@@ -7,49 +7,53 @@ import {
   type UserId,
   type MatchId,
   type PlayerRole,
-  evaluateTag,
-  initialProximityState,
-  isInsideFence,
-  isImplausibleMove,
   type Geofence,
   type ProximityState,
+  type GeofenceState,
+  evaluateTag,
+  initialProximityState,
+  evaluateGeofence,
+  initialGeofenceState,
+  isInsideFence,
+  isImplausibleMove,
 } from "@oni/shared";
+import type { MatchService } from "../services/matchService.ts";
 
 interface PlayerSession {
   userId: UserId;
-  role: PlayerRole;
   socket: WebSocket;
   lastLocation: LocationSample | null;
-  /** 鬼との近接状態(逃走者ごと)。 */
+  /** 鬼との近接状態。 */
   proximity: ProximityState;
+  /** ジオフェンス境界の猶予状態。 */
+  geofence: GeofenceState;
 }
 
-/** 1試合分のインメモリ状態。永続化は別途 DB に書き出す。 */
 interface MatchRoom {
   matchId: MatchId;
   fence: Geofence;
   tagDistanceM: number;
-  oniId: UserId | null;
   players: Map<UserId, PlayerSession>;
 }
 
 /**
- * リアルタイム鬼ごっこサーバー。
+ * リアルタイム鬼ごっこサーバー(権威判定)。
  *
- * - クライアントからの位置更新を受け取り
- * - チート(テレポート)・ジオフェンス境界を検証し
- * - 鬼⇔逃走者の距離から鬼交代を権威判定し
- * - 結果を全プレイヤーへブロードキャストする
- *
- * NOTE: Phase 4 で判定ロジックを本格実装。ここは骨組み + コア判定の結線。
+ * クライアントの位置更新を受け、チート検知・ジオフェンス猶予判定・鬼交代判定を行い、
+ * 役割交代は MatchService に委譲して鬼時間を正しく積算する。
  */
 export class GameServer {
   private readonly wss: WebSocketServer;
   private readonly rooms = new Map<MatchId, MatchRoom>();
 
-  constructor(server: Server) {
+  constructor(server: Server, private readonly matchService: MatchService) {
     this.wss = new WebSocketServer({ server, path: "/ws" });
     this.wss.on("connection", (socket) => this.onConnection(socket));
+  }
+
+  /** 試合開始時に REST 側から呼ばれ、リアルタイム判定の対象にする。 */
+  registerRoom(matchId: MatchId, fence: Geofence, tagDistanceM: number): void {
+    this.rooms.set(matchId, { matchId, fence, tagDistanceM, players: new Map() });
   }
 
   private onConnection(socket: WebSocket): void {
@@ -69,7 +73,7 @@ export class GameServer {
       case "join_match":
         return this.join(socket, event.matchId, event.userId);
       case "leave_match":
-        return this.leave(event.matchId, event.userId);
+        return void this.rooms.get(event.matchId)?.players.delete(event.userId);
       case "location_update":
         return this.onLocation(event.matchId, event.userId, event.location);
     }
@@ -78,22 +82,14 @@ export class GameServer {
   private join(socket: WebSocket, matchId: MatchId, userId: UserId): void {
     const room = this.rooms.get(matchId);
     if (!room) return this.send(socket, { type: "error", message: "match_not_found" });
-
-    const role: PlayerRole = room.oniId === null ? "oni" : "runner";
-    if (role === "oni") room.oniId = userId;
-
     room.players.set(userId, {
       userId,
-      role,
       socket,
       lastLocation: null,
       proximity: initialProximityState(),
+      geofence: initialGeofenceState(),
     });
     this.send(socket, { type: "match_state", matchId, status: "joined" });
-  }
-
-  private leave(matchId: MatchId, userId: UserId): void {
-    this.rooms.get(matchId)?.players.delete(userId);
   }
 
   private onLocation(matchId: MatchId, userId: UserId, location: LocationSample): void {
@@ -103,21 +99,29 @@ export class GameServer {
 
     // 1) チート検知: 直前サンプルからの移動速度が非現実的なら脱落
     if (player.lastLocation && isImplausibleMove(player.lastLocation, location)) {
-      this.eliminate(room, player, "cheat");
-      return;
+      return this.eliminate(room, player, "cheat");
     }
     player.lastLocation = location;
 
-    // 2) ジオフェンス境界チェック
-    if (!isInsideFence(location, room.fence)) {
-      // MVP: 即脱落。Phase 5 で猶予秒数つき警告に拡張。
-      this.eliminate(room, player, "out_of_bounds");
-      return;
+    // 2) ジオフェンス: 猶予つき判定(即脱落させず警告→猶予経過で脱落)
+    const inside = isInsideFence(location, room.fence);
+    const fenceJudgment = evaluateGeofence(inside, location.timestamp, player.geofence);
+    player.geofence = fenceJudgment.state;
+    if (fenceJudgment.status === "eliminated") {
+      return this.eliminate(room, player, "out_of_bounds");
+    }
+    if (fenceJudgment.status === "warning") {
+      this.send(player.socket, {
+        type: "geofence_warning",
+        matchId,
+        userId,
+        graceSecLeft: fenceJudgment.graceSecLeft,
+      });
     }
 
-    // 3) 鬼交代判定(逃走者の位置更新時のみ、鬼との距離を評価)
-    if (player.role === "runner" && room.oniId) {
-      const oni = room.players.get(room.oniId);
+    // 3) 鬼交代判定(逃走者の更新時に、現在の鬼との距離を評価)
+    if (this.roleOf(matchId, userId) === "runner") {
+      const oni = this.currentOniSession(room);
       if (oni?.lastLocation) {
         const judgment = evaluateTag(
           oni.lastLocation,
@@ -127,42 +131,52 @@ export class GameServer {
           player.proximity,
         );
         player.proximity = judgment.state;
-        if (judgment.tagged) this.switchOni(room, userId);
+        if (judgment.tagged) this.switchOni(room, userId, location.timestamp);
       }
     }
 
     this.broadcastPositions(room);
   }
 
-  /** 役割交代: 新しい鬼を設定し、旧鬼を逃走者に戻す。 */
-  private switchOni(room: MatchRoom, newOni: UserId): void {
-    const previousOni = room.oniId;
-    if (previousOni === null) return;
+  /** 役割交代を MatchService に委譲し、結果を全員へ通知する。 */
+  private switchOni(room: MatchRoom, newOni: UserId, at: number): void {
+    let previousOni: UserId;
+    try {
+      previousOni = this.matchService.applyTagSwitch(room.matchId, newOni, at);
+    } catch {
+      return; // 既に脱落/不整合な場合は無視
+    }
+    // タッチした逃走者の近接状態をリセットして連続交代を防ぐ
+    room.players.get(newOni)!.proximity = initialProximityState();
+    this.broadcast(room, { type: "role_changed", matchId: room.matchId, newOni, previousOni, at });
+  }
 
-    const prev = room.players.get(previousOni);
-    const next = room.players.get(newOni);
-    if (prev) prev.role = "runner";
-    if (next) next.role = "oni";
-    room.oniId = newOni;
+  private currentOniSession(room: MatchRoom): PlayerSession | undefined {
+    const match = this.matchService.get(room.matchId);
+    const oniId = match?.players.find((p) => p.role === "oni")?.userId;
+    return oniId ? room.players.get(oniId) : undefined;
+  }
 
-    this.broadcast(room, {
-      type: "role_changed",
-      matchId: room.matchId,
-      newOni,
-      previousOni,
-      at: Date.now(),
-    });
+  private roleOf(matchId: MatchId, userId: UserId): PlayerRole | undefined {
+    return this.matchService.get(matchId)?.players.find((p) => p.userId === userId)?.role;
   }
 
   private eliminate(room: MatchRoom, player: PlayerSession, reason: "out_of_bounds" | "cheat"): void {
+    this.matchService.eliminate(room.matchId, player.userId);
     room.players.delete(player.userId);
     this.broadcast(room, { type: "eliminated", matchId: room.matchId, userId: player.userId, reason });
   }
 
   private broadcastPositions(room: MatchRoom): void {
+    const match = this.matchService.get(room.matchId);
+    const roleById = new Map(match?.players.map((p) => [p.userId, p.role]) ?? []);
     const players = [...room.players.values()]
       .filter((p) => p.lastLocation)
-      .map((p) => ({ userId: p.userId, role: p.role, location: p.lastLocation! }));
+      .map((p) => ({
+        userId: p.userId,
+        role: roleById.get(p.userId) ?? ("runner" as PlayerRole),
+        location: p.lastLocation!,
+      }));
     this.broadcast(room, { type: "players_positions", matchId: room.matchId, players });
   }
 
@@ -172,10 +186,5 @@ export class GameServer {
 
   private send(socket: WebSocket, event: ServerEvent): void {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
-  }
-
-  /** 試合開始時にルームを登録する(REST 側から呼ぶ想定の骨組み)。 */
-  registerRoom(matchId: MatchId, fence: Geofence, tagDistanceM: number): void {
-    this.rooms.set(matchId, { matchId, fence, tagDistanceM, oniId: null, players: new Map() });
   }
 }
