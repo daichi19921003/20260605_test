@@ -1,0 +1,19 @@
+{
+  "name": "oni",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Oni - リアル空間の鬼ごっこ SNS アプリ (GPS + ジオフェンス)",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

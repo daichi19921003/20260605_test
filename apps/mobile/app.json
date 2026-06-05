@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "Oni",
+    "slug": "oni",
+    "version": "0.0.0",
+    "orientation": "portrait",
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "鬼ごっこ中に他のプレイヤーと位置を共有するために使用します。",
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ]
+    ],
+    "ios": {
+      "infoPlist": {
+        "UIBackgroundModes": ["location"],
+        "NSLocationWhenInUseUsageDescription": "鬼ごっこ中の位置共有に使用します。",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "鬼ごっこ中の位置共有に使用します。"
+      }
+    },
+    "android": {
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION"
+      ]
+    }
+  }
+}
